@@ -10,6 +10,8 @@ from openapi_core.contrib.starlette.responses import StarletteOpenAPIResponse
 
 from app.config import Settings
 from app.openapi_loader import OperationMeta
+from app.schema_synthesizer import SchemaSynthesizer
+from app.seq2seq_generator import Seq2SeqGenerator
 from app.semantic_validator import SemanticValidator
 from app.utils import extract_json_value, json_dumps
 
@@ -22,9 +24,16 @@ class ResponseGenerationError(Exception):
 
 
 class DynamicResponseGenerator:
-    def __init__(self, settings: Settings, semantic_validator: SemanticValidator) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        semantic_validator: SemanticValidator,
+        seq2seq_generator: Seq2SeqGenerator | None = None,
+    ) -> None:
         self.settings = settings
         self.semantic_validator = semantic_validator
+        self.seq2seq_generator = seq2seq_generator
+        self.schema_synthesizer = SchemaSynthesizer()
 
     async def generate(
         self,
@@ -36,8 +45,10 @@ class DynamicResponseGenerator:
         n: int,
         temperature: float | None = None,
     ) -> list[Any]:
-        if not self.settings.openrouter_api_key:
-            raise ResponseGenerationError("OPENROUTER_API_KEY is not configured.")
+        if not self._has_active_generation_source():
+            raise ResponseGenerationError(
+                "No generation source available. Enable Seq2Seq or configure OPENROUTER_API_KEY."
+            )
 
         output: list[Any] = []
         for _ in range(n):
@@ -63,6 +74,7 @@ class DynamicResponseGenerator:
     ) -> Any:
         last_error = "No candidate generated."
         fallback_candidate: Any | None = None
+        fallback_source = ""
         best_semantic_score = -1.0
         semantic_schema_source = {
             "endpoint": operation.path,
@@ -77,55 +89,101 @@ class DynamicResponseGenerator:
         }
 
         for attempt in range(1, self.settings.max_retry_attempts + 1):
-            try:
-                prompt = self._build_prompt(
-                    operation=operation,
-                    validated_request_body=validated_request_body,
-                    context_payload=context_payload,
-                )
-                candidate = await self._call_openrouter(prompt, temperature=temperature)
-                if not self._is_structurally_valid(
-                    operation=operation,
-                    openapi=openapi,
-                    openapi_request=openapi_request,
-                    candidate=candidate,
-                ):
-                    last_error = "Candidate failed OpenAPI response validation."
-                    continue
-
-                semantic_schema_score = await self.semantic_validator.score(
-                    semantic_schema_source,
-                    candidate,
-                )
-                semantic_context_score = await self.semantic_validator.score(
-                    semantic_context_source,
-                    candidate,
-                )
-                semantic_score = (0.75 * semantic_schema_score) + (0.25 * semantic_context_score)
-                if semantic_score > best_semantic_score:
-                    best_semantic_score = semantic_score
-                    fallback_candidate = candidate
-
-                if semantic_score < self.settings.semantic_similarity_threshold:
-                    last_error = (
-                        "Candidate failed semantic similarity validation "
-                        f"(score={semantic_score:.3f}, threshold={self.settings.semantic_similarity_threshold:.3f})."
+            prompt = self._build_prompt(
+                operation=operation,
+                validated_request_body=validated_request_body,
+                context_payload=context_payload,
+            )
+            for source in self._generation_source_order():
+                try:
+                    candidate = await self._generate_candidate(
+                        source=source,
+                        prompt=prompt,
+                        temperature=temperature,
                     )
-                    continue
+                    if candidate is None:
+                        last_error = f"{source} source unavailable."
+                        continue
 
-                return candidate
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
-                logger.debug("Response generation attempt %s failed: %s", attempt, exc)
+                    candidate = self.schema_synthesizer.build(
+                        schema=operation.response_schema,
+                        request_body=validated_request_body,
+                        path_parameters=context_payload.get("path_parameters"),
+                        collection=str(context_payload.get("collection", "")),
+                        source_candidate=candidate,
+                    )
+
+                    if not self._is_structurally_valid(
+                        operation=operation,
+                        openapi=openapi,
+                        openapi_request=openapi_request,
+                        candidate=candidate,
+                    ):
+                        last_error = f"{source} candidate failed OpenAPI response validation."
+                        continue
+
+                    semantic_score = 1.0
+                    if self.settings.semantic_validation_enabled:
+                        semantic_schema_score = await self.semantic_validator.score(
+                            semantic_schema_source,
+                            candidate,
+                        )
+                        semantic_context_score = await self.semantic_validator.score(
+                            semantic_context_source,
+                            candidate,
+                        )
+                        semantic_score = (0.75 * semantic_schema_score) + (0.25 * semantic_context_score)
+                    if semantic_score > best_semantic_score:
+                        best_semantic_score = semantic_score
+                        fallback_candidate = candidate
+                        fallback_source = source
+
+                    if (
+                        self.settings.semantic_validation_enabled
+                        and semantic_score < self.settings.semantic_similarity_threshold
+                    ):
+                        last_error = (
+                            f"{source} candidate failed semantic similarity validation "
+                            f"(score={semantic_score:.3f}, "
+                            f"threshold={self.settings.semantic_similarity_threshold:.3f})."
+                        )
+                        continue
+
+                    return candidate
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"{source} generation failed: {exc}"
+                    logger.debug(
+                        "Response generation attempt %s via %s failed: %s",
+                        attempt,
+                        source,
+                        exc,
+                    )
 
         if fallback_candidate is not None and self.settings.semantic_fail_open:
             logger.warning(
                 "Returning structurally valid fallback candidate after semantic retries failed. "
-                "best_score=%.3f threshold=%.3f",
+                "source=%s best_score=%.3f threshold=%.3f",
+                fallback_source,
                 best_semantic_score,
                 self.settings.semantic_similarity_threshold,
             )
             return fallback_candidate
+
+        schema_candidate = self._build_schema_fallback_candidate(
+            operation=operation,
+            validated_request_body=validated_request_body,
+            context_payload=context_payload,
+        )
+        if schema_candidate is not None and self._is_structurally_valid(
+            operation=operation,
+            openapi=openapi,
+            openapi_request=openapi_request,
+            candidate=schema_candidate,
+        ):
+            logger.warning(
+                "Returning schema-derived fallback candidate after generation retries failed."
+            )
+            return schema_candidate
 
         raise ResponseGenerationError(
             f"Failed to generate a valid response after {self.settings.max_retry_attempts} attempts. "
@@ -149,6 +207,48 @@ class DynamicResponseGenerator:
         openapi_response = StarletteOpenAPIResponse(response)
         result = openapi.unmarshal_response(openapi_request, openapi_response)
         return len(result.errors) == 0
+
+    async def _generate_candidate(
+        self,
+        source: str,
+        prompt: str,
+        temperature: float | None = None,
+    ) -> Any | None:
+        if source == "seq2seq":
+            if self.seq2seq_generator is None:
+                return None
+            return await self.seq2seq_generator.generate_json(prompt, temperature=temperature)
+        if source == "openrouter":
+            return await self._call_openrouter(prompt, temperature=temperature)
+        raise ResponseGenerationError(f"Unknown generation source: {source}")
+
+    def _generation_source_order(self) -> list[str]:
+        sources: list[str] = []
+        has_seq2seq = self.seq2seq_generator is not None and self.seq2seq_generator.enabled
+        if has_seq2seq:
+            sources.append("seq2seq")
+
+        openrouter_allowed = self.settings.openrouter_enabled and bool(self.settings.openrouter_api_key)
+        if openrouter_allowed and (not has_seq2seq or self.settings.openrouter_fallback_enabled):
+            sources.append("openrouter")
+        return sources
+
+    def _has_active_generation_source(self) -> bool:
+        return bool(self._generation_source_order())
+
+    def _build_schema_fallback_candidate(
+        self,
+        operation: OperationMeta,
+        validated_request_body: Any,
+        context_payload: dict[str, Any],
+    ) -> Any | None:
+        return self.schema_synthesizer.build(
+            schema=operation.response_schema,
+            request_body=validated_request_body,
+            path_parameters=context_payload.get("path_parameters"),
+            collection=str(context_payload.get("collection", "")),
+            source_candidate=None,
+        )
 
     async def _call_openrouter(self, prompt: str, temperature: float | None = None) -> Any:
         selected_temperature = (

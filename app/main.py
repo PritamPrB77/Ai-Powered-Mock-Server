@@ -17,6 +17,7 @@ from app.openapi_loader import OpenAPILoader, OperationMeta
 from app.request_validator import OpenAPIRequestValidator, RequestValidationError
 from app.response_generator import DynamicResponseGenerator, ResponseGenerationError
 from app.route_generator import DynamicRouteManager
+from app.seq2seq_generator import Seq2SeqGenerator
 from app.semantic_validator import SemanticValidator
 from app.utils import clamp_multi_response_count
 
@@ -39,9 +40,11 @@ class RuntimeState:
             model_name=settings.semantic_model_name,
             threshold=settings.semantic_similarity_threshold,
         )
+        self.seq2seq_generator = Seq2SeqGenerator(settings=settings)
         self.response_generator = DynamicResponseGenerator(
             settings=settings,
             semantic_validator=self.semantic_validator,
+            seq2seq_generator=self.seq2seq_generator,
         )
 
         self.spec_dict: dict[str, Any] | None = None
@@ -149,6 +152,15 @@ def create_app() -> FastAPI:
     settings = get_settings()
     runtime = RuntimeState(app, settings)
     app.state.runtime = runtime
+
+    @app.on_event("startup")
+    async def startup_warmup() -> None:
+        if runtime.settings.seq2seq_enabled and runtime.settings.seq2seq_warmup_on_startup:
+            loaded = await runtime.seq2seq_generator.warmup()
+            if loaded:
+                logger.info("Seq2Seq model warmed up.")
+            else:
+                logger.warning("Seq2Seq warmup skipped or failed; runtime will use available fallbacks.")
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
