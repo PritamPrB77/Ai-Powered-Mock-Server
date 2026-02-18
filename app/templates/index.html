@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Mock Server</title>
+    <style>
+        :root {
+            --bg: #f5f7fb;
+            --card: #ffffff;
+            --text: #1f2937;
+            --muted: #4b5563;
+            --accent: #0f766e;
+            --border: #d1d5db;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(140deg, #eef2ff 0%, var(--bg) 45%, #ecfeff 100%);
+            color: var(--text);
+        }
+        .container {
+            max-width: 980px;
+            margin: 2rem auto;
+            padding: 1rem;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 1.2rem;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+        }
+        h1 {
+            margin-top: 0;
+            margin-bottom: 0.35rem;
+            font-size: 1.5rem;
+        }
+        p { margin-top: 0; color: var(--muted); }
+        textarea {
+            width: 100%;
+            min-height: 230px;
+            padding: 0.75rem;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            font-family: Consolas, monospace;
+            font-size: 0.9rem;
+        }
+        .controls {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+            flex-wrap: wrap;
+            margin: 0.8rem 0;
+        }
+        button {
+            border: 0;
+            border-radius: 10px;
+            background: var(--accent);
+            color: white;
+            padding: 0.6rem 1rem;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        button:hover { opacity: 0.95; }
+        #status {
+            margin-top: 0.5rem;
+            font-size: 0.92rem;
+            color: var(--muted);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 0.5rem;
+        }
+        th, td {
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+            padding: 0.55rem;
+        }
+        th { font-size: 0.86rem; color: var(--muted); text-transform: uppercase; }
+        .method {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.2rem 0.6rem;
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.03rem;
+            background: #d1fae5;
+            color: #065f46;
+        }
+        @media (max-width: 700px) {
+            .container { margin: 1rem auto; }
+            textarea { min-height: 180px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="card">
+        <h1>AI Dynamic Mock Server</h1>
+        <p>Upload or paste an OpenAPI YAML/JSON spec. Endpoints are generated server-side and can be tested in Postman.</p>
+
+        <form id="uploadForm">
+            <textarea id="specText" name="spec_text" placeholder="Paste OpenAPI YAML/JSON here..."></textarea>
+            <div class="controls">
+                <label>Or upload file: <input type="file" id="specFile" name="spec_file" accept=".yaml,.yml,.json,text/plain"></label>
+                <button type="submit">Upload Spec</button>
+                <button type="button" id="refreshBtn">Refresh Endpoints</button>
+            </div>
+        </form>
+        <div id="status">No spec uploaded in this session.</div>
+    </div>
+
+    <div class="card" style="margin-top: 1rem;">
+        <h1 style="font-size: 1.25rem;">Registered Endpoints</h1>
+        <table>
+            <thead>
+            <tr>
+                <th>Method</th>
+                <th>Path</th>
+                <th>Operation ID</th>
+            </tr>
+            </thead>
+            <tbody id="endpointTableBody">
+            <tr><td colspan="3">No endpoints registered.</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    const statusEl = document.getElementById("status");
+    const tableBody = document.getElementById("endpointTableBody");
+
+    async function fetchEndpoints() {
+        const resp = await fetch("/registered-endpoints");
+        const data = await resp.json();
+        renderEndpoints(data.endpoints || []);
+    }
+
+    function renderEndpoints(endpoints) {
+        if (!endpoints.length) {
+            tableBody.innerHTML = '<tr><td colspan="3">No endpoints registered.</td></tr>';
+            return;
+        }
+        tableBody.innerHTML = endpoints.map((item) => `
+            <tr>
+                <td><span class="method">${item.method}</span></td>
+                <td><code>${item.path}</code></td>
+                <td><code>${item.operation_id}</code></td>
+            </tr>
+        `).join("");
+    }
+
+    document.getElementById("uploadForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        statusEl.textContent = "Uploading spec...";
+
+        const formData = new FormData();
+        const textValue = document.getElementById("specText").value.trim();
+        const fileInput = document.getElementById("specFile");
+
+        if (textValue) {
+            formData.append("spec_text", textValue);
+        }
+        if (fileInput.files.length > 0) {
+            formData.append("spec_file", fileInput.files[0]);
+        }
+
+        try {
+            const resp = await fetch("/upload-spec", { method: "POST", body: formData });
+            const data = await resp.json();
+            if (!resp.ok) {
+                statusEl.textContent = `Upload failed: ${JSON.stringify(data.detail || data)}`;
+                return;
+            }
+            statusEl.textContent = `Spec uploaded. Registered ${data.registered} endpoint(s), skipped ${data.skipped}.`;
+            await fetchEndpoints();
+        } catch (error) {
+            statusEl.textContent = `Upload failed: ${error}`;
+        }
+    });
+
+    document.getElementById("refreshBtn").addEventListener("click", async () => {
+        statusEl.textContent = "Refreshing endpoints...";
+        try {
+            await fetchEndpoints();
+            statusEl.textContent = "Endpoints refreshed.";
+        } catch (error) {
+            statusEl.textContent = `Refresh failed: ${error}`;
+        }
+    });
+
+    fetchEndpoints();
+</script>
+</body>
+</html>
+
