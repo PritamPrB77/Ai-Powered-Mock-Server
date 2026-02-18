@@ -1,0 +1,68 @@
+openapi: 3.0.3
+info:
+  title: Bhagavad Gita API
+  version: 1.0.0
+  description: Simple API to fetch Bhagavad Gita chapters and verses.
+
+paths:
+  /chapters:
+    get:
+      summary: Get all chapters
+      responses:
+        '200':
+          description: List of chapters
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    chapter_number:
+                      type: integer
+                    name:
+                      type: string
+                    translation:
+                      type: string
+                  required:
+                    - chapter_number
+                    - name
+                    - translation
+
+  /chapters/{chapterNumber}/verses/{verseNumber}:
+    get:
+      summary: Get a specific verse
+      parameters:
+        - name: chapterNumber
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: verseNumber
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Verse details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chapter_number:
+                    type: integer
+                  verse_number:
+                    type: integer
+                  sanskrit:
+                    type: string
+                  translation:
+                    type: string
+                  commentary:
+                    type: string
+                required:
+                  - chapter_number
+                  - verse_number
+                  - sanskrit
+                  - translation
