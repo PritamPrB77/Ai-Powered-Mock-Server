@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,7 @@ class RuntimeState:
         request_body = validation.body
         parameters = validation.parameters
         path_parameters = dict(getattr(parameters, "path", {}) or {})
+        query_parameters = dict(getattr(parameters, "query", {}) or {})
 
         if operation.method == "get":
             cached = self.context_engine.get_cached_get_response(operation.path, path_parameters)
@@ -111,6 +113,18 @@ class RuntimeState:
             method=operation.method,
             path_parameters=path_parameters,
         )
+        context_payload["query_parameters"] = query_parameters
+        spec_info = self.spec_dict.get("info") if isinstance(self.spec_dict, dict) else {}
+        if not isinstance(spec_info, dict):
+            spec_info = {}
+        context_payload["api_info"] = {
+            "title": spec_info.get("title"),
+            "description": spec_info.get("description"),
+            "version": spec_info.get("version"),
+        }
+        context_payload["operation_summary"] = operation.summary
+        context_payload["operation_description"] = operation.description
+        context_payload["request_nonce"] = time.time_ns()
 
         try:
             generated = await self.response_generator.generate(

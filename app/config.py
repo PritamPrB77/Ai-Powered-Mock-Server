@@ -10,13 +10,31 @@ except Exception:  # noqa: BLE001
 
 
 class Settings(BaseSettings):
-    openrouter_enabled: bool = Field(default=True)
+    generation_provider: str = Field(default="ollama")
+
+    openrouter_enabled: bool = Field(default=False)
     openrouter_api_key: str = Field(default="")
-    openrouter_model: str = Field(default="mistralai/mistral-7b-instruct")
+    openrouter_model: str = Field(default="openai/gpt-4o-mini")
     openrouter_url: str = Field(default="https://openrouter.ai/api/v1/chat/completions")
     openrouter_http_referer: str = Field(default="http://localhost:8000")
     openrouter_app_title: str = Field(default="Dynamic AI Mock Server")
-    openrouter_fallback_enabled: bool = Field(default=True)
+    openrouter_fallback_enabled: bool = Field(default=False)
+
+    ollama_enabled: bool = Field(default=True)
+    ollama_url: str = Field(default="http://localhost:11434/api/generate")
+    ollama_model: str = Field(default="qwen2.5:3b")
+    ollama_fallback_enabled: bool = Field(default=False)
+    ollama_num_predict: int = Field(default=256)
+    ollama_top_k: int = Field(default=20)
+    ollama_top_p: float = Field(default=0.9)
+    ollama_system_prompt: str = Field(
+        default=(
+            "You are an API response generator for a dynamic mock server. "
+            "Return strictly valid JSON only. "
+            "Do not output markdown or explanations. "
+            "Follow the response schema exactly and do not add extra fields."
+        )
+    )
 
     generation_temperature: float = Field(default=0.3)
     generation_max_tokens: int = Field(default=512)
@@ -24,7 +42,7 @@ class Settings(BaseSettings):
     max_retry_attempts: int = Field(default=3)
     max_multi_response: int = Field(default=10)
 
-    seq2seq_enabled: bool = Field(default=True)
+    seq2seq_enabled: bool = Field(default=False)
     seq2seq_model_name: str = Field(default="google/flan-t5-base")
     seq2seq_max_input_tokens: int = Field(default=1024)
     seq2seq_max_new_tokens: int = Field(default=256)

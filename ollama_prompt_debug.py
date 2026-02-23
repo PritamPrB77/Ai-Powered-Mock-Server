@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import re
 import sys
@@ -43,6 +44,37 @@ def _safe_print(text: Any) -> None:
     encoding = sys.stdout.encoding or "utf-8"
     safe = value.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
     print(safe)
+
+
+def _matches_response_shape_local(schema: dict[str, Any] | None, candidate: Any) -> bool:
+    if not isinstance(schema, dict):
+        return True
+    expected_type = schema.get("type")
+    if expected_type == "object":
+        return isinstance(candidate, dict)
+    if expected_type == "array":
+        return isinstance(candidate, list)
+    return True
+
+
+def _normalize_candidate_shape_local(schema: dict[str, Any] | None, candidate: Any) -> Any:
+    if not isinstance(schema, dict):
+        return candidate
+    expected_type = schema.get("type")
+    if expected_type == "array":
+        if isinstance(candidate, list):
+            return candidate
+        if isinstance(candidate, dict):
+            list_values = [value for value in candidate.values() if isinstance(value, list)]
+            if len(list_values) == 1:
+                return list_values[0]
+            if len(list_values) > 1:
+                return max(list_values, key=len)
+            return [candidate]
+    if expected_type == "object":
+        if isinstance(candidate, list) and len(candidate) == 1 and isinstance(candidate[0], dict):
+            return candidate[0]
+    return candidate
 
 
 def _compile_path_template(template: str) -> tuple[re.Pattern[str], list[str]]:
@@ -121,8 +153,8 @@ async def _run(args: argparse.Namespace) -> None:
         path_template=operation.path,
         method=operation.method,
         path_parameters=path_parameters,
-        query_parameters=query_parameters,
     )
+    context_payload["query_parameters"] = query_parameters
     info = spec_dict.get("info", {}) if isinstance(spec_dict, dict) else {}
     if not isinstance(info, dict):
         info = {}
@@ -144,12 +176,21 @@ async def _run(args: argparse.Namespace) -> None:
         seq2seq_generator=None,
     )
 
-    task_prompt = DynamicResponseGenerator._build_prompt(
-        operation=operation,
-        validated_request_body=request_body,
-        context_payload=context_payload,
-        independent_requests=settings.generation_independent_requests,
-    )
+    independent_mode = bool(getattr(settings, "generation_independent_requests", False))
+    build_prompt_signature = inspect.signature(DynamicResponseGenerator._build_prompt)
+    if "independent_requests" in build_prompt_signature.parameters:
+        task_prompt = DynamicResponseGenerator._build_prompt(
+            operation=operation,
+            validated_request_body=request_body,
+            context_payload=context_payload,
+            independent_requests=independent_mode,
+        )
+    else:
+        task_prompt = DynamicResponseGenerator._build_prompt(
+            operation=operation,
+            validated_request_body=request_body,
+            context_payload=context_payload,
+        )
     full_prompt = generator._build_ollama_prompt(task_prompt)
 
     print("=== Request Debug ===")
@@ -157,7 +198,7 @@ async def _run(args: argparse.Namespace) -> None:
     print(f"Operation: {operation.method.upper()} {operation.path}")
     print(f"Resolved path params: {json_dumps(path_parameters)}")
     print(f"Query params: {json_dumps(query_parameters)}")
-    print(f"Independent mode: {settings.generation_independent_requests}")
+    print(f"Independent mode: {independent_mode}")
 
     print("\n=== Prompt ===")
     if args.show_prompt:
@@ -197,6 +238,9 @@ async def _run(args: argparse.Namespace) -> None:
         response.raise_for_status()
         data = response.json()
 
+    print(f"Ollama model (requested): {payload['model']}")
+    print(f"Ollama model (response): {data.get('model')}")
+
     raw_output = data.get("response")
     if not isinstance(raw_output, str):
         raise ValueError(f"Unexpected Ollama response payload: {data}")
@@ -205,23 +249,39 @@ async def _run(args: argparse.Namespace) -> None:
     _safe_print(raw_output)
 
     parsed = extract_json_value(raw_output)
-    normalized = DynamicResponseGenerator._normalize_candidate_shape(operation.response_schema, parsed)
-    shape_ok = DynamicResponseGenerator._matches_response_shape(operation.response_schema, normalized)
-    synthesized = generator.schema_synthesizer.build(
-        schema=operation.response_schema,
-        request_body=request_body,
-        path_parameters=path_parameters,
-        collection=context_payload.get("collection"),
-        source_candidate=normalized,
-    )
-    final_candidate = DynamicResponseGenerator._enforce_identifier_consistency(
-        synthesized,
-        context_payload,
-    )
+    normalize_fn = getattr(DynamicResponseGenerator, "_normalize_candidate_shape", None)
+    if callable(normalize_fn):
+        normalized = normalize_fn(operation.response_schema, parsed)
+    else:
+        normalized = _normalize_candidate_shape_local(operation.response_schema, parsed)
+
+    shape_fn = getattr(DynamicResponseGenerator, "_matches_response_shape", None)
+    if callable(shape_fn):
+        shape_ok = shape_fn(operation.response_schema, normalized)
+    else:
+        shape_ok = _matches_response_shape_local(operation.response_schema, normalized)
+
+    if shape_ok:
+        final_candidate = normalized
+        used_schema_fallback = False
+    else:
+        synthesized = generator.schema_synthesizer.build(
+            schema=operation.response_schema,
+            request_body=request_body,
+            path_parameters=path_parameters,
+            collection=context_payload.get("collection"),
+            source_candidate=normalized,
+        )
+        final_candidate = synthesized
+        enforce_fn = getattr(DynamicResponseGenerator, "_enforce_identifier_consistency", None)
+        if callable(enforce_fn):
+            final_candidate = enforce_fn(synthesized, context_payload)
+        used_schema_fallback = True
 
     print("\n=== Parsed Candidate (normalized) ===")
     _safe_print(json_dumps(normalized))
     print(f"\nShape match: {shape_ok}")
+    print(f"Schema fallback used: {used_schema_fallback}")
 
     print("\n=== Final Candidate (after synthesizer + identifier consistency) ===")
     _safe_print(json_dumps(final_candidate))

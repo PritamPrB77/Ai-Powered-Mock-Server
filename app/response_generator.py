@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -47,7 +48,8 @@ class DynamicResponseGenerator:
     ) -> list[Any]:
         if not self._has_active_generation_source():
             raise ResponseGenerationError(
-                "No generation source available. Enable Seq2Seq or configure OPENROUTER_API_KEY."
+                "No generation source available. Enable Seq2Seq, or configure the selected "
+                "GENERATION_PROVIDER (ollama/openrouter)."
             )
 
         output: list[Any] = []
@@ -96,31 +98,39 @@ class DynamicResponseGenerator:
             )
             for source in self._generation_source_order():
                 try:
-                    candidate = await self._generate_candidate(
+                    raw_candidate = await self._generate_candidate(
                         source=source,
                         prompt=prompt,
                         temperature=temperature,
                     )
-                    if candidate is None:
+                    if raw_candidate is None:
                         last_error = f"{source} source unavailable."
                         continue
 
-                    candidate = self.schema_synthesizer.build(
-                        schema=operation.response_schema,
-                        request_body=validated_request_body,
-                        path_parameters=context_payload.get("path_parameters"),
-                        collection=str(context_payload.get("collection", "")),
-                        source_candidate=candidate,
-                    )
-
-                    if not self._is_structurally_valid(
+                    candidate = self._normalize_candidate_shape(operation.response_schema, raw_candidate)
+                    if self._is_structurally_valid(
                         operation=operation,
                         openapi=openapi,
                         openapi_request=openapi_request,
                         candidate=candidate,
                     ):
-                        last_error = f"{source} candidate failed OpenAPI response validation."
-                        continue
+                        pass
+                    else:
+                        candidate = self.schema_synthesizer.build(
+                            schema=operation.response_schema,
+                            request_body=validated_request_body,
+                            path_parameters=context_payload.get("path_parameters"),
+                            collection=str(context_payload.get("collection", "")),
+                            source_candidate=candidate,
+                        )
+                        if not self._is_structurally_valid(
+                            operation=operation,
+                            openapi=openapi,
+                            openapi_request=openapi_request,
+                            candidate=candidate,
+                        ):
+                            last_error = f"{source} candidate failed OpenAPI response validation."
+                            continue
 
                     semantic_score = 1.0
                     if self.settings.semantic_validation_enabled:
@@ -218,20 +228,34 @@ class DynamicResponseGenerator:
             if self.seq2seq_generator is None:
                 return None
             return await self.seq2seq_generator.generate_json(prompt, temperature=temperature)
+        if source == "ollama":
+            return await self._call_ollama(prompt, temperature=temperature)
         if source == "openrouter":
             return await self._call_openrouter(prompt, temperature=temperature)
         raise ResponseGenerationError(f"Unknown generation source: {source}")
 
     def _generation_source_order(self) -> list[str]:
-        sources: list[str] = []
-        has_seq2seq = self.seq2seq_generator is not None and self.seq2seq_generator.enabled
-        if has_seq2seq:
-            sources.append("seq2seq")
-
+        provider = self._provider_name()
+        ollama_allowed = (
+            self.settings.ollama_enabled
+            and bool(self.settings.ollama_url)
+            and bool(self.settings.ollama_model)
+        )
         openrouter_allowed = self.settings.openrouter_enabled and bool(self.settings.openrouter_api_key)
-        if openrouter_allowed and (not has_seq2seq or self.settings.openrouter_fallback_enabled):
-            sources.append("openrouter")
-        return sources
+
+        if provider == "ollama":
+            return ["ollama"] if ollama_allowed else []
+        if provider == "openrouter":
+            return ["openrouter"] if openrouter_allowed else []
+
+        has_seq2seq = self.seq2seq_generator is not None and self.seq2seq_generator.enabled
+        return ["seq2seq"] if has_seq2seq else []
+
+    def _provider_name(self) -> str:
+        provider = str(self.settings.generation_provider).strip().lower()
+        if provider in {"ollama", "openrouter"}:
+            return provider
+        return "ollama"
 
     def _has_active_generation_source(self) -> bool:
         return bool(self._generation_source_order())
@@ -249,6 +273,60 @@ class DynamicResponseGenerator:
             collection=str(context_payload.get("collection", "")),
             source_candidate=None,
         )
+
+    async def _call_ollama(self, prompt: str, temperature: float | None = None) -> Any:
+        selected_temperature = (
+            self.settings.generation_temperature
+            if temperature is None
+            else float(temperature)
+        )
+        full_prompt = self._build_ollama_prompt(prompt)
+        payload = {
+            "model": self.settings.ollama_model,
+            "prompt": full_prompt,
+            "format": "json",
+            "stream": False,
+            "options": {
+                "temperature": selected_temperature,
+                "num_predict": self.settings.ollama_num_predict,
+                "top_k": self.settings.ollama_top_k,
+                "top_p": self.settings.ollama_top_p,
+                "seed": int(time.time_ns() % 2147483647),
+            },
+        }
+
+        timeout = httpx.Timeout(self.settings.generation_timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                response = await client.post(
+                    self.settings.ollama_url,
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text.strip() if exc.response is not None else str(exc)
+                raise ResponseGenerationError(f"Ollama request failed: {detail}") from exc
+            except httpx.RequestError as exc:
+                raise ResponseGenerationError(f"Ollama connection failed: {exc}") from exc
+            data = response.json()
+
+        try:
+            llm_text = data["response"]
+        except (KeyError, TypeError) as exc:
+            raise ResponseGenerationError(f"Unexpected Ollama response payload: {data}") from exc
+
+        if not isinstance(llm_text, str):
+            raise ResponseGenerationError(f"Unexpected Ollama response payload: {data}")
+
+        logger.info(
+            "Ollama response received. model=%s chars=%s",
+            self.settings.ollama_model,
+            len(llm_text),
+        )
+        logger.debug("Ollama raw output: %s", llm_text)
+
+        return extract_json_value(llm_text)
 
     async def _call_openrouter(self, prompt: str, temperature: float | None = None) -> Any:
         selected_temperature = (
@@ -295,27 +373,75 @@ class DynamicResponseGenerator:
 
         return extract_json_value(llm_text)
 
+    def _build_ollama_prompt(self, task_prompt: str) -> str:
+        system_prompt = self.settings.ollama_system_prompt.strip()
+        if not system_prompt:
+            system_prompt = "Return strictly valid JSON only."
+        return (
+            f"{system_prompt}\n\n"
+            "Task:\n"
+            f"{task_prompt}\n\n"
+            "Output:\n"
+            "JSON only."
+        )
+
     @staticmethod
     def _build_prompt(
         operation: OperationMeta,
         validated_request_body: Any,
         context_payload: dict[str, Any],
     ) -> str:
+        api_info = context_payload.get("api_info")
+        operation_summary = context_payload.get("operation_summary")
+        operation_description = context_payload.get("operation_description")
+        path_parameters = context_payload.get("path_parameters")
+        query_parameters = context_payload.get("query_parameters")
         return (
-            "You are generating a dynamic mock API response.\n\n"
-            f"Endpoint: {operation.path}\n"
-            f"Method: {operation.method.upper()}\n\n"
-            "Sequence-to-sequence context:\n"
-            "1) Read request schema and validated request data.\n"
-            "2) Map request intent into response schema fields.\n"
-            "3) Produce final JSON output.\n\n"
-            f"Request Schema:\n{json_dumps(operation.request_schema)}\n\n"
-            f"Response Schema:\n{json_dumps(operation.response_schema)}\n\n"
-            f"Validated Request Body:\n{json_dumps(validated_request_body)}\n\n"
-            f"System Context:\n{json_dumps(context_payload)}\n\n"
-            "Output constraints:\n"
-            "- Return JSON only.\n"
-            "- Match response schema exactly.\n"
-            "- Do not add extra fields.\n"
-            "- Ensure logical consistency with request and context."
+            "You are an autonomous API response generation engine.\n\n"
+            "Generate one dynamic response for the current request.\n\n"
+            "Rules:\n"
+            "1. Follow RESPONSE_SCHEMA exactly (type, required fields, allowed fields).\n"
+            "2. Use endpoint path, method, path/query params, and request body when logically relevant.\n"
+            "3. Preserve identifiers from request inputs when semantically appropriate.\n"
+            "4. Keep non-identifier fields realistic and naturally varied.\n"
+            "5. Do not add markdown, explanations, or extra fields.\n"
+            "6. Output strictly valid JSON only.\n\n"
+            f"API Info:\n{json_dumps(api_info)}\n\n"
+            f"Endpoint path: {operation.path}\n"
+            f"HTTP method: {operation.method.upper()}\n\n"
+            f"Operation summary:\n{json_dumps(operation_summary)}\n\n"
+            f"Operation description:\n{json_dumps(operation_description)}\n\n"
+            f"Request schema:\n{json_dumps(operation.request_schema)}\n\n"
+            f"Response schema:\n{json_dumps(operation.response_schema)}\n\n"
+            f"Validated request body:\n{json_dumps(validated_request_body)}\n\n"
+            f"Path parameters:\n{json_dumps(path_parameters)}\n\n"
+            f"Query parameters:\n{json_dumps(query_parameters)}\n\n"
+            "Return only JSON."
         )
+
+    @staticmethod
+    def _normalize_candidate_shape(schema: dict[str, Any] | None, candidate: Any) -> Any:
+        if not isinstance(schema, dict):
+            return candidate
+
+        expected_type = schema.get("type")
+        if expected_type == "array":
+            if isinstance(candidate, list):
+                return candidate
+            if isinstance(candidate, dict):
+                list_values = [value for value in candidate.values() if isinstance(value, list)]
+                if len(list_values) == 1:
+                    return list_values[0]
+                if len(list_values) > 1:
+                    return max(list_values, key=len)
+                return [candidate]
+            return candidate
+
+        if expected_type == "object":
+            if isinstance(candidate, dict):
+                return candidate
+            if isinstance(candidate, list) and len(candidate) == 1 and isinstance(candidate[0], dict):
+                return candidate[0]
+            return candidate
+
+        return candidate

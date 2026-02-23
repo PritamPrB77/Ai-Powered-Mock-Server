@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from app.utils import json_dumps
+from app.utils import coerce_int, json_dumps
 
 
 class SchemaSynthesizer:
@@ -36,6 +36,41 @@ class SchemaSynthesizer:
         "Khan",
     )
     EMAIL_DOMAINS = ("example.com", "mail.test", "demo.local")
+    IDENTIFIER_POSITIVE_STEMS = (
+        "id",
+        "identifier",
+        "key",
+        "code",
+        "number",
+        "index",
+        "sequence",
+        "serial",
+        "ordinal",
+        "position",
+        "rank",
+        "level",
+        "reference",
+        "ref",
+        "token",
+        "uuid",
+        "slug",
+        "handle",
+        "parent",
+        "child",
+    )
+    IDENTIFIER_NEGATIVE_STEMS = (
+        "name",
+        "title",
+        "summary",
+        "description",
+        "message",
+        "content",
+        "text",
+        "email",
+        "address",
+        "status",
+        "note",
+    )
 
     def build(
         self,
@@ -164,17 +199,31 @@ class SchemaSynthesizer:
         required_list = required if isinstance(required, list) else []
 
         output: dict[str, Any] = {}
-        keys = list(props.keys())
-        for key in keys:
-            prop_schema = props.get(key)
+        for key, prop_schema in props.items():
             if not isinstance(prop_schema, dict):
                 continue
 
-            selected_source = source_obj.get(key)
-            if selected_source is None and key in request_body:
-                selected_source = request_body[key]
-            if selected_source is None and key in path_parameters:
-                selected_source = path_parameters[key]
+            source_selected = self._lookup_mapping_value(source_obj, key)
+            request_selected = self._lookup_mapping_value(request_body, key)
+            path_selected = self._lookup_mapping_value(path_parameters, key)
+
+            if self._is_identifier_like_field(
+                field_name=key,
+                schema=prop_schema,
+                request_body=request_body,
+                path_parameters=path_parameters,
+            ):
+                selected_source = path_selected
+                if selected_source is None:
+                    selected_source = request_selected
+                if selected_source is None:
+                    selected_source = source_selected
+            else:
+                selected_source = source_selected
+                if selected_source is None:
+                    selected_source = request_selected
+                if selected_source is None:
+                    selected_source = path_selected
 
             output[key] = self._build_node(
                 schema=prop_schema,
@@ -217,8 +266,9 @@ class SchemaSynthesizer:
             return []
 
         source_list = source_value if isinstance(source_value, list) else []
-        if not source_list and field_name and isinstance(request_body.get(field_name), list):
-            source_list = request_body[field_name]
+        request_list = self._lookup_mapping_value(request_body, field_name) if field_name else None
+        if not source_list and isinstance(request_list, list):
+            source_list = request_list
 
         min_items = schema.get("minItems")
         target_count = min_items if isinstance(min_items, int) and min_items > 0 else 1
@@ -255,6 +305,14 @@ class SchemaSynthesizer:
         fmt = str(schema.get("format", "")).lower()
 
         if isinstance(source_value, str) and source_value.strip():
+            if self._should_bind_path_context(
+                field_name=field_name,
+                schema=schema,
+                source_value=source_value,
+                request_body=request_body,
+                path_parameters=path_parameters,
+            ):
+                return self._ensure_path_context_in_text(source_value, path_parameters)
             return source_value
 
         exact_id = self._infer_exact_identifier(field_name, request_body, path_parameters)
@@ -265,21 +323,29 @@ class SchemaSynthesizer:
         if fmt == "date":
             return datetime.now(timezone.utc).date().isoformat()
         if fmt == "email" or "email" in field:
+            best_seed = self._best_text_seed(request_body)
             local_name = self._safe_slug(
-                request_body.get("name")
-                or request_body.get("customerName")
+                best_seed
                 or f"user{generic_id or rng.randint(100, 999)}"
             )
             return f"{local_name}@{rng.choice(self.EMAIL_DOMAINS)}"
         if fmt == "uuid":
             return str(uuid4())
 
-        if field_name and field_name in request_body and request_body[field_name] is not None:
-            return str(request_body[field_name])
-        if field_name and field_name in path_parameters and path_parameters[field_name] is not None:
-            return str(path_parameters[field_name])
+        if field_name:
+            from_request = self._lookup_mapping_value(request_body, field_name)
+            if from_request is not None:
+                return str(from_request)
+            from_path = self._lookup_mapping_value(path_parameters, field_name)
+            if from_path is not None:
+                return str(from_path)
 
-        if field.endswith("id") or field == "id":
+        if self._is_identifier_like_field(
+            field_name=field_name,
+            schema=schema,
+            request_body=request_body,
+            path_parameters=path_parameters,
+        ):
             return exact_id or self._generate_identifier(field_name, collection, rng)
 
         if "name" in field:
@@ -292,20 +358,36 @@ class SchemaSynthesizer:
                 return f"{resource_title} {generic_id}"
             return f"{rng.choice(self.FIRST_NAMES)} {rng.choice(self.LAST_NAMES)}"
 
-        if any(token in field for token in ("note", "description", "summary", "title")):
-            resource_title = self._resource_title(collection)
-            return f"{resource_title} detail {rng.randint(1000, 9999)}"
+        if self._should_generate_contextual_text(
+            field_name=field_name,
+            schema=schema,
+            request_body=request_body,
+            path_parameters=path_parameters,
+        ):
+            text = self._build_contextual_text_value(
+                field_name=field_name,
+                collection=collection,
+                request_body=request_body,
+                path_parameters=path_parameters,
+                rng=rng,
+            )
+            min_len = schema.get("minLength")
+            if isinstance(min_len, int) and min_len > len(text):
+                text = text + ("x" * (min_len - len(text)))
+            return text
 
         min_len = schema.get("minLength")
-        base = f"value_{rng.randint(100, 999)}"
+        base_key = self._normalize_key(field_name or "value")
+        base = f"{base_key}_{rng.randint(100, 999)}"
         if isinstance(min_len, int) and min_len > len(base):
             base = base + ("x" * (min_len - len(base)))
         return base
 
     @staticmethod
     def _build_integer(schema: dict[str, Any], source_value: Any, rng: random.Random) -> int:
-        if isinstance(source_value, int) and not isinstance(source_value, bool):
-            return source_value
+        parsed = coerce_int(source_value)
+        if parsed is not None:
+            return parsed
 
         minimum = schema.get("minimum")
         maximum = schema.get("maximum")
@@ -319,6 +401,11 @@ class SchemaSynthesizer:
     def _build_number(schema: dict[str, Any], source_value: Any, rng: random.Random) -> float:
         if isinstance(source_value, (int, float)) and not isinstance(source_value, bool):
             return float(source_value)
+        if isinstance(source_value, str):
+            try:
+                return float(source_value.strip())
+            except ValueError:
+                pass
 
         minimum = schema.get("minimum")
         maximum = schema.get("maximum")
@@ -337,47 +424,286 @@ class SchemaSynthesizer:
         if not field_name:
             return None
 
-        if field_name in request_body and request_body[field_name] is not None:
-            return str(request_body[field_name])
-        if field_name in path_parameters and path_parameters[field_name] is not None:
-            return str(path_parameters[field_name])
-
-        lowered = field_name.lower()
-        for key, value in request_body.items():
-            if str(key).lower() == lowered and value is not None:
-                return str(value)
-        for key, value in path_parameters.items():
-            if str(key).lower() == lowered and value is not None:
-                return str(value)
-
+        from_request = self._lookup_mapping_value(request_body, field_name)
+        if from_request is not None:
+            return str(from_request)
+        from_path = self._lookup_mapping_value(path_parameters, field_name)
+        if from_path is not None:
+            return str(from_path)
         return None
 
-    @staticmethod
     def _infer_any_identifier(
+        self,
         request_body: dict[str, Any],
         path_parameters: dict[str, Any],
     ) -> str | None:
-        for key, value in path_parameters.items():
-            if str(key).lower().endswith("id") and value is not None:
-                return str(value)
-        for key, value in request_body.items():
-            if str(key).lower().endswith("id") and value is not None:
-                return str(value)
+        for source in (path_parameters, request_body):
+            for key, value in source.items():
+                if value is None:
+                    continue
+                if self._is_identifier_like_field(
+                    field_name=str(key),
+                    schema=None,
+                    request_body=request_body,
+                    path_parameters=path_parameters,
+                ):
+                    return str(value)
+        return None
+
+    @classmethod
+    def _lookup_mapping_value(cls, mapping: dict[str, Any], field_name: str | None) -> Any | None:
+        if not field_name:
+            return None
+        if field_name in mapping and mapping[field_name] is not None:
+            return mapping[field_name]
+
+        lowered = field_name.lower()
+        for key, value in mapping.items():
+            if str(key).lower() == lowered and value is not None:
+                return value
+
+        normalized = cls._normalize_key(field_name)
+        for key, value in mapping.items():
+            if cls._normalize_key(str(key)) == normalized and value is not None:
+                return value
         return None
 
     @staticmethod
+    def _normalize_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    @staticmethod
+    def _path_context_hint(path_parameters: dict[str, Any]) -> str:
+        ordered = [f"{key}={value}" for key, value in path_parameters.items()]
+        return ", ".join(ordered) if ordered else "request"
+
+    @staticmethod
+    def _humanize_field(field_name: str | None) -> str:
+        if not field_name:
+            return "value"
+        return re.sub(r"_+", " ", field_name).strip().lower()
+
+    def _build_contextual_text_value(
+        self,
+        field_name: str | None,
+        collection: str | None,
+        request_body: dict[str, Any],
+        path_parameters: dict[str, Any],
+        rng: random.Random,
+    ) -> str:
+        pieces: list[str] = []
+        descriptor = self._humanize_field(field_name)
+        pieces.append(descriptor if descriptor != "value" else "detail")
+
+        if collection:
+            pieces.append(f"for {self._resource_title(collection)}")
+        if path_parameters:
+            pieces.append(f"({self._path_context_hint(path_parameters)})")
+
+        seed = self._best_text_seed(request_body)
+        if seed:
+            compact_seed = " ".join(seed.split())
+            if len(compact_seed) > 48:
+                compact_seed = compact_seed[:45].rstrip() + "..."
+            pieces.append(f"based on {compact_seed}")
+
+        pieces.append(f"ref-{rng.randint(1000, 9999)}")
+        return " ".join(pieces)
+
+    def _should_generate_contextual_text(
+        self,
+        field_name: str | None,
+        schema: dict[str, Any],
+        request_body: dict[str, Any],
+        path_parameters: dict[str, Any],
+    ) -> bool:
+        return self._is_descriptive_string_field(
+            field_name=field_name,
+            schema=schema,
+            request_body=request_body,
+            path_parameters=path_parameters,
+        )
+
+    def _should_bind_path_context(
+        self,
+        field_name: str | None,
+        schema: dict[str, Any],
+        source_value: str,
+        request_body: dict[str, Any],
+        path_parameters: dict[str, Any],
+    ) -> bool:
+        if not path_parameters:
+            return False
+        if not source_value.strip():
+            return False
+        if not self._is_descriptive_string_field(
+            field_name=field_name,
+            schema=schema,
+            request_body=request_body,
+            path_parameters=path_parameters,
+        ):
+            return False
+        lowered_text = source_value.lower()
+        return not any(
+            str(value).lower() in lowered_text
+            for value in path_parameters.values()
+            if value is not None
+        )
+
+    def _is_descriptive_string_field(
+        self,
+        field_name: str | None,
+        schema: dict[str, Any],
+        request_body: dict[str, Any],
+        path_parameters: dict[str, Any],
+    ) -> bool:
+        if not field_name:
+            return False
+        if self._is_identifier_like_field(
+            field_name=field_name,
+            schema=schema,
+            request_body=request_body,
+            path_parameters=path_parameters,
+        ):
+            return False
+
+        field_text = field_name.lower()
+        if "name" in field_text:
+            return False
+
+        fmt = str(schema.get("format", "")).lower()
+        if fmt in {"date", "date-time", "email", "uuid", "uri", "url", "ipv4", "ipv6", "hostname"}:
+            return False
+
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and enum_values:
+            return False
+        return True
+
+    @staticmethod
+    def _is_identifier_like_field(
+        field_name: str | None,
+        schema: dict[str, Any] | None,
+        request_body: dict[str, Any],
+        path_parameters: dict[str, Any],
+    ) -> bool:
+        if not field_name:
+            return False
+
+        if isinstance(schema, dict):
+            if schema.get("x-identifier") is True or schema.get("x-primary-key") is True:
+                return True
+            fmt = str(schema.get("format", "")).lower()
+            if fmt == "uuid":
+                return True
+
+        tokens = SchemaSynthesizer._tokenize_field_name(field_name)
+        if not tokens:
+            return False
+
+        positive_score = 0.0
+        negative_score = 0.0
+        for token in tokens:
+            positive_similarity = max(
+                SchemaSynthesizer._token_similarity(token, stem)
+                for stem in SchemaSynthesizer.IDENTIFIER_POSITIVE_STEMS
+            )
+            negative_similarity = max(
+                SchemaSynthesizer._token_similarity(token, stem)
+                for stem in SchemaSynthesizer.IDENTIFIER_NEGATIVE_STEMS
+            )
+            if positive_similarity >= 0.9:
+                positive_score += 1.0
+            else:
+                positive_score += positive_similarity * 0.5
+            if negative_similarity >= 0.9:
+                negative_score += 1.0
+            else:
+                negative_score += negative_similarity * 0.5
+
+        compact_field = SchemaSynthesizer._normalize_key(field_name)
+        context_keys = list(path_parameters.keys()) + list(request_body.keys())
+        for key in context_keys:
+            normalized_key = SchemaSynthesizer._normalize_key(str(key))
+            if not normalized_key:
+                continue
+            if compact_field == normalized_key:
+                positive_score += 0.4
+            if compact_field.endswith(normalized_key) or normalized_key.endswith(compact_field):
+                positive_score += 0.2
+
+        if compact_field.isdigit():
+            positive_score += 0.2
+        if any(char.isdigit() for char in compact_field):
+            positive_score += 0.1
+
+        return positive_score > (negative_score + 0.25)
+
+    @staticmethod
+    def _tokenize_field_name(value: str | None) -> list[str]:
+        text = str(value or "")
+        if not text:
+            return []
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+        text = re.sub(r"[^a-zA-Z0-9]+", " ", text).strip().lower()
+        tokens = [token for token in text.split() if token]
+        return [SchemaSynthesizer._canonicalize_token(token) for token in tokens if token]
+
+    @staticmethod
+    def _canonicalize_token(token: str) -> str:
+        if len(token) > 5 and token.endswith("ing"):
+            return token[:-3]
+        if len(token) > 4 and token.endswith("ed"):
+            return token[:-2]
+        if len(token) > 4 and token.endswith("es"):
+            return token[:-2]
+        if len(token) > 3 and token.endswith("s"):
+            return token[:-1]
+        return token
+
+    @staticmethod
+    def _token_similarity(token: str, reference: str) -> float:
+        if not token or not reference:
+            return 0.0
+        if token == reference:
+            return 1.0
+        if token.startswith(reference) or reference.startswith(token):
+            return 0.92
+        longest = 0
+        token_len = len(token)
+        ref_len = len(reference)
+        for i in range(token_len):
+            for j in range(i + 1, token_len + 1):
+                fragment = token[i:j]
+                if fragment and fragment in reference:
+                    longest = max(longest, len(fragment))
+        return float(longest) / float(max(token_len, ref_len))
+
+    def _best_text_seed(self, request_body: dict[str, Any]) -> str | None:
+        if not isinstance(request_body, dict):
+            return None
+
+        for value in request_body.values():
+            if isinstance(value, str):
+                text = value.strip()
+                if 2 <= len(text) <= 80:
+                    return text
+        return None
+
+    def _ensure_path_context_in_text(self, text: str, path_parameters: dict[str, Any]) -> str:
+        marker = self._path_context_hint(path_parameters)
+        lowered_text = text.lower()
+        has_any_path_value = any(str(value).lower() in lowered_text for value in path_parameters.values())
+        if has_any_path_value:
+            return text
+        return f"{text} [{marker}]"
+
+    @staticmethod
     def _generate_identifier(field_name: str | None, collection: str | None, rng: random.Random) -> str:
-        base = (field_name or collection or "id").lower()
-        if "order" in base:
-            prefix = "ord"
-        elif "customer" in base:
-            prefix = "cus"
-        elif "ticket" in base:
-            prefix = "tkt"
-        elif "catalog" in base or "sku" in base:
-            prefix = "sku"
-        else:
-            prefix = "id"
+        base = SchemaSynthesizer._normalize_key(field_name or collection or "id")
+        if not base:
+            base = "id"
+        prefix = base[:6] if len(base) >= 2 else "id"
         return f"{prefix}_{rng.randint(1000, 9999)}"
 
     @staticmethod
