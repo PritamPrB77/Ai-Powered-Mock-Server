@@ -1,0 +1,176 @@
+openapi: 3.0.3
+info:
+  title: NovaTrack Testing API
+  description: A lightweight experimental API for testing device tracking and analytics flows.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000/api/v1
+    description: Local Development Server
+
+paths:
+
+  /status:
+    get:
+      summary: Check API health
+      tags:
+        - System
+      responses:
+        '200':
+          description: API is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service:
+                    type: string
+                  uptime:
+                    type: string
+                  version:
+                    type: string
+
+  /devices:
+    get:
+      summary: List all registered devices
+      tags:
+        - Devices
+      responses:
+        '200':
+          description: List of devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Device'
+
+    post:
+      summary: Register a new device
+      tags:
+        - Devices
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceCreate'
+      responses:
+        '201':
+          description: Device created successfully
+
+  /devices/{deviceId}:
+    get:
+      summary: Get device details
+      tags:
+        - Devices
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Device details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '404':
+          description: Device not found
+
+  /devices/{deviceId}/metrics:
+    get:
+      summary: Fetch latest metrics of a device
+      tags:
+        - Metrics
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Device metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Metrics'
+
+  /analytics/summary:
+    get:
+      summary: Get system analytics summary
+      tags:
+        - Analytics
+      responses:
+        '200':
+          description: Summary data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsSummary'
+
+components:
+  schemas:
+
+    Device:
+      type: object
+      properties:
+        id:
+          type: string
+          example: DEV-90812
+        name:
+          type: string
+          example: ColdChain-Sensor-A1
+        status:
+          type: string
+          enum: [active, inactive, maintenance]
+        createdAt:
+          type: string
+          format: date-time
+
+    DeviceCreate:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          example: ColdChain-Sensor-A1
+        location:
+          type: string
+          example: Warehouse-7
+
+    Metrics:
+      type: object
+      properties:
+        temperature:
+          type: number
+          format: float
+          example: 4.5
+        humidity:
+          type: number
+          format: float
+          example: 72.3
+        batteryLevel:
+          type: integer
+          example: 89
+        recordedAt:
+          type: string
+          format: date-time
+
+    AnalyticsSummary:
+      type: object
+      properties:
+        totalDevices:
+          type: integer
+          example: 120
+        activeDevices:
+          type: integer
+          example: 97
+        averageTemperature:
+          type: number
+          format: float
+          example: 5.1

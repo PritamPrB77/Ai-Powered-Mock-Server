@@ -1,0 +1,154 @@
+openapi: 3.0.3
+info:
+  title: WisdomFlow API
+  description: |
+    A philosophical knowledge API providing structured life insights,
+    virtues, and reflective teachings for testing purposes.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8080/api
+    description: Local Testing Server
+
+paths:
+
+  /teachings:
+    get:
+      summary: Get all core teachings
+      tags:
+        - Teachings
+      responses:
+        '200':
+          description: List of teachings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Teaching'
+
+  /teachings/{chapterId}:
+    get:
+      summary: Get teachings by chapter
+      tags:
+        - Teachings
+      parameters:
+        - name: chapterId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Chapter teachings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Chapter'
+        '404':
+          description: Chapter not found
+
+  /virtues:
+    get:
+      summary: Get list of virtues for personal growth
+      tags:
+        - Virtues
+      responses:
+        '200':
+          description: List of virtues
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Virtue'
+
+  /reflection/daily:
+    get:
+      summary: Get today's reflection message
+      tags:
+        - Reflection
+      responses:
+        '200':
+          description: Daily reflection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reflection'
+
+  /paths/{pathType}/advantages:
+    get:
+      summary: Get advantages of a life path
+      tags:
+        - Life Paths
+      parameters:
+        - name: pathType
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [knowledge, action, devotion, discipline]
+      responses:
+        '200':
+          description: Advantages of selected path
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                  advantages:
+                    type: array
+                    items:
+                      type: string
+
+components:
+  schemas:
+
+    Teaching:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        title:
+          type: string
+          example: The Balance of Mind
+        message:
+          type: string
+          example: True strength comes from inner clarity, not outer noise.
+
+    Chapter:
+      type: object
+      properties:
+        chapterId:
+          type: integer
+          example: 2
+        theme:
+          type: string
+          example: Self-Mastery
+        teachings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Teaching'
+
+    Virtue:
+      type: object
+      properties:
+        name:
+          type: string
+          example: Patience
+        description:
+          type: string
+          example: The ability to stay calm and composed in adversity.
+
+    Reflection:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        thought:
+          type: string
+          example: Let your actions be guided by purpose, not fear.
