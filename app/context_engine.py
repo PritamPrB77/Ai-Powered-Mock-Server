@@ -21,6 +21,7 @@ class ContextEngine:
         path_template: str,
         method: str,
         path_parameters: dict[str, Any] | None = None,
+        query_parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         collection = self._collection_name(path_template)
         entities = self.context_store["entities"].get(collection, {})
@@ -31,6 +32,7 @@ class ContextEngine:
             "collection": collection,
             "method": method.upper(),
             "path_parameters": deepcopy(path_parameters or {}),
+            "query_parameters": deepcopy(query_parameters or {}),
             "known_entities_for_collection": deepcopy(entities),
             "resolved_entity": deepcopy(relevant_entity),
             "recent_history": deepcopy(recent_history),
@@ -120,16 +122,26 @@ class ContextEngine:
     def _extract_path_identifier(path_parameters: dict[str, Any]) -> str | None:
         if not path_parameters:
             return None
-        first_value = next(iter(path_parameters.values()))
-        return str(first_value) if first_value is not None else None
+        parts: list[str] = []
+        for key, value in path_parameters.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        if not parts:
+            return None
+        return "|".join(parts)
 
     @staticmethod
     def _resolve_entity_from_path(path_parameters: dict[str, Any], entities: dict[str, Any]) -> Any | None:
         if not path_parameters:
             return None
+
+        composite_key = ContextEngine._extract_path_identifier(path_parameters)
+        if composite_key and composite_key in entities:
+            return entities[composite_key]
+
         for value in path_parameters.values():
             key = str(value)
             if key in entities:
                 return entities[key]
         return None
-

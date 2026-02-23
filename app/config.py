@@ -10,13 +10,51 @@ except Exception:  # noqa: BLE001
 
 
 class Settings(BaseSettings):
-    openrouter_enabled: bool = Field(default=True)
+    generation_provider: str = Field(default="openrouter")
+
+    openrouter_enabled: bool = Field(default=False)
     openrouter_api_key: str = Field(default="")
-    openrouter_model: str = Field(default="mistralai/mistral-7b-instruct")
+    openrouter_model: str = Field(default="openai/gpt-4o-mini")
     openrouter_url: str = Field(default="https://openrouter.ai/api/v1/chat/completions")
     openrouter_http_referer: str = Field(default="http://localhost:8000")
     openrouter_app_title: str = Field(default="Dynamic AI Mock Server")
     openrouter_fallback_enabled: bool = Field(default=True)
+    openrouter_history_turns: int = Field(default=5)
+    openrouter_strict_generation: bool = Field(default=True)
+    openrouter_allow_provider_fallbacks: bool = Field(default=False)
+    openrouter_system_prompt: str = Field(
+        default=(
+            "You are an intelligent API response generator inside a dynamic mock server.\n\n"
+            "The incoming request has already passed schema validation.\n\n"
+            "Your responsibilities:\n"
+            "1. Inspect the OpenAPI endpoint definition and its response schema.\n"
+            "2. Understand the structure, required fields, data types, and constraints dynamically.\n"
+            "3. Generate a context-aware response that is logically consistent with:\n"
+            "   - The endpoint path\n"
+            "   - Path parameters\n"
+            "   - Query parameters\n"
+            "   - Request body (if present)\n"
+            "   - Any inferred relationships between fields\n"
+            "4. Do not echo input values in placeholder-style text.\n"
+            "5. Avoid static templating patterns.\n"
+            "6. Ensure semantic coherence across all returned fields.\n"
+            "7. If the request refers to a resource that should not exist, return a properly "
+            "structured error response matching the defined error schema.\n\n"
+            "Output strictly valid JSON.\n"
+            "Do not include explanations.\n"
+            "Do not add fields outside the schema.\n"
+            "Ensure responses vary naturally across different executions while remaining "
+            "logically consistent."
+        )
+    )
+
+    ollama_enabled: bool = Field(default=True)
+    ollama_url: str = Field(default="http://localhost:11434/api/generate")
+    ollama_model: str = Field(default="qwen3:5")
+    ollama_fallback_enabled: bool = Field(default=True)
+    ollama_num_predict: int = Field(default=256)
+    ollama_top_k: int = Field(default=20)
+    ollama_top_p: float = Field(default=0.9)
 
     generation_temperature: float = Field(default=0.3)
     generation_max_tokens: int = Field(default=512)

@@ -1,0 +1,136 @@
+openapi: 3.0.3
+info:
+  title: Smart Utility API
+  description: A simple API providing system info, quotes, weather mock data, and device status.
+  version: 1.0.0
+
+servers:
+  - url: https://api.smartutility.com/v1
+    description: Production server
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+
+  /health:
+    get:
+      summary: Check API health status
+      description: Returns the current health status of the API.
+      responses:
+        '200':
+          description: API is running successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  uptime:
+                    type: string
+                    example: "72 hours"
+
+  /quote:
+    get:
+      summary: Get a random motivational quote
+      description: Returns a randomly generated motivational quote.
+      responses:
+        '200':
+          description: A random quote
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  author:
+                    type: string
+                    example: "Albert Einstein"
+                  quote:
+                    type: string
+                    example: "Life is like riding a bicycle. To keep your balance you must keep moving."
+
+  /time:
+    get:
+      summary: Get current server time
+      description: Returns the current server date and time.
+      responses:
+        '200':
+          description: Current server time
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  datetime:
+                    type: string
+                    format: date-time
+                    example: "2026-02-23T10:15:30Z"
+                  timezone:
+                    type: string
+                    example: "UTC"
+
+  /devices/status:
+    get:
+      summary: Get status of all devices
+      description: Returns a list of connected devices and their status.
+      responses:
+        '200':
+          description: List of device statuses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_devices:
+                    type: integer
+                    example: 3
+                  devices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        device_id:
+                          type: string
+                          example: "DEV-001"
+                        status:
+                          type: string
+                          example: "online"
+                        last_seen:
+                          type: string
+                          format: date-time
+                          example: "2026-02-23T09:45:00Z"
+
+  /users/{userId}:
+    get:
+      summary: Get user profile by ID
+      description: Fetches user details using user ID.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          description: Unique ID of the user
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User profile data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id:
+                    type: string
+                    example: "U123"
+                  name:
+                    type: string
+                    example: "Pritam"
+                  role:
+                    type: string
+                    example: "admin"
+                  active:
+                    type: boolean
+                    example: true
+        '404':
+          description: User not found

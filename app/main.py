@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,7 @@ class RuntimeState:
         request_body = validation.body
         parameters = validation.parameters
         path_parameters = dict(getattr(parameters, "path", {}) or {})
+        query_parameters = dict(getattr(parameters, "query", {}) or {})
 
         if operation.method == "get":
             cached = self.context_engine.get_cached_get_response(operation.path, path_parameters)
@@ -110,7 +112,19 @@ class RuntimeState:
             path_template=operation.path,
             method=operation.method,
             path_parameters=path_parameters,
+            query_parameters=query_parameters,
         )
+        spec_info = self.spec_dict.get("info") if isinstance(self.spec_dict, dict) else {}
+        if not isinstance(spec_info, dict):
+            spec_info = {}
+        context_payload["api_info"] = {
+            "title": spec_info.get("title"),
+            "description": spec_info.get("description"),
+            "version": spec_info.get("version"),
+        }
+        context_payload["operation_summary"] = operation.summary
+        context_payload["operation_description"] = operation.description
+        context_payload["request_nonce"] = time.time_ns()
 
         try:
             generated = await self.response_generator.generate(
@@ -170,6 +184,19 @@ def create_app() -> FastAPI:
     async def registered_endpoints() -> dict[str, Any]:
         endpoints = runtime.route_manager.list_registered_endpoints()
         return {"count": len(endpoints), "endpoints": endpoints}
+
+    @app.get("/generation-status")
+    async def generation_status() -> dict[str, Any]:
+        return {
+            "generation_provider": runtime.settings.generation_provider,
+            "openrouter_enabled": runtime.settings.openrouter_enabled,
+            "openrouter_model": runtime.settings.openrouter_model,
+            "openrouter_strict_generation": runtime.settings.openrouter_strict_generation,
+            "openrouter_allow_provider_fallbacks": runtime.settings.openrouter_allow_provider_fallbacks,
+            "ollama_enabled": runtime.settings.ollama_enabled,
+            "seq2seq_enabled": runtime.settings.seq2seq_enabled,
+            "source_order": runtime.response_generator._generation_source_order(),
+        }
 
     @app.post("/upload-spec")
     async def upload_spec(

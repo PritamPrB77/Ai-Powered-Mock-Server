@@ -52,22 +52,41 @@ def extract_json_value(text: str) -> Any:
     decoder = json.JSONDecoder()
 
     try:
-        return json.loads(cleaned)
+        return _decode_nested_json_strings(json.loads(cleaned))
     except json.JSONDecodeError:
         pass
 
-    valid_starts = set('{["-0123456789tfn')
-    for idx, char in enumerate(cleaned):
-        if char not in valid_starts:
-            continue
-        snippet = cleaned[idx:]
-        try:
-            value, _ = decoder.raw_decode(snippet)
-            return value
-        except json.JSONDecodeError:
-            continue
+    prioritized_start_sets = (
+        set("{["),                 # Prefer structured payloads first.
+        set('"-0123456789tfn'),    # Then allow primitive JSON values.
+    )
+    for valid_starts in prioritized_start_sets:
+        for idx, char in enumerate(cleaned):
+            if char not in valid_starts:
+                continue
+            snippet = cleaned[idx:]
+            try:
+                value, _ = decoder.raw_decode(snippet)
+                return _decode_nested_json_strings(value)
+            except json.JSONDecodeError:
+                continue
 
     raise ValueError("LLM output did not contain a valid JSON value.")
+
+
+def _decode_nested_json_strings(value: Any, max_depth: int = 2) -> Any:
+    current = value
+    for _ in range(max_depth):
+        if not isinstance(current, str):
+            return current
+        text = current.strip()
+        if not text or text[0] not in "{[":
+            return current
+        try:
+            current = json.loads(text)
+        except json.JSONDecodeError:
+            return current
+    return current
 
 
 def resolve_json_pointer(document: dict[str, Any], pointer: str) -> Any | None:
@@ -141,4 +160,3 @@ def _resolve_refs(
         ]
 
     return node
-
