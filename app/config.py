@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     ollama_num_predict: int = Field(default=256)
     ollama_top_k: int = Field(default=20)
     ollama_top_p: float = Field(default=0.9)
+    ollama_repeat_penalty: float = Field(default=1.2)
     ollama_system_prompt: str = Field(
         default=(
             "You are an API response generator for a dynamic mock server. "
@@ -41,6 +42,7 @@ class Settings(BaseSettings):
     generation_timeout_seconds: int = Field(default=45)
     max_retry_attempts: int = Field(default=3)
     max_multi_response: int = Field(default=10)
+    generation_independent_requests: bool = Field(default=True)
 
     seq2seq_enabled: bool = Field(default=False)
     seq2seq_model_name: str = Field(default="google/flan-t5-base")

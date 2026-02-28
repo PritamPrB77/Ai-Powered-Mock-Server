@@ -178,19 +178,22 @@ async def _run(args: argparse.Namespace) -> None:
 
     independent_mode = bool(getattr(settings, "generation_independent_requests", False))
     build_prompt_signature = inspect.signature(DynamicResponseGenerator._build_prompt)
+    prompt_kwargs: dict[str, Any] = {
+        "operation": operation,
+        "validated_request_body": request_body,
+        "context_payload": context_payload,
+    }
     if "independent_requests" in build_prompt_signature.parameters:
-        task_prompt = DynamicResponseGenerator._build_prompt(
-            operation=operation,
-            validated_request_body=request_body,
-            context_payload=context_payload,
-            independent_requests=independent_mode,
-        )
-    else:
-        task_prompt = DynamicResponseGenerator._build_prompt(
-            operation=operation,
-            validated_request_body=request_body,
-            context_payload=context_payload,
-        )
+        prompt_kwargs["independent_requests"] = independent_mode
+    if "attempt_number" in build_prompt_signature.parameters:
+        prompt_kwargs["attempt_number"] = 1
+    if "max_attempts" in build_prompt_signature.parameters:
+        prompt_kwargs["max_attempts"] = settings.max_retry_attempts
+    if "previous_failures" in build_prompt_signature.parameters:
+        prompt_kwargs["previous_failures"] = []
+    if "blocked_literals" in build_prompt_signature.parameters:
+        prompt_kwargs["blocked_literals"] = []
+    task_prompt = DynamicResponseGenerator._build_prompt(**prompt_kwargs)
     full_prompt = generator._build_ollama_prompt(task_prompt)
 
     print("=== Request Debug ===")
@@ -223,6 +226,7 @@ async def _run(args: argparse.Namespace) -> None:
             "num_predict": settings.ollama_num_predict,
             "top_k": settings.ollama_top_k,
             "top_p": settings.ollama_top_p,
+            "repeat_penalty": settings.ollama_repeat_penalty,
             "seed": int(time.time_ns() % 2147483647),
         },
     }
@@ -261,29 +265,22 @@ async def _run(args: argparse.Namespace) -> None:
     else:
         shape_ok = _matches_response_shape_local(operation.response_schema, normalized)
 
-    if shape_ok:
-        final_candidate = normalized
-        used_schema_fallback = False
-    else:
-        synthesized = generator.schema_synthesizer.build(
-            schema=operation.response_schema,
-            request_body=request_body,
-            path_parameters=path_parameters,
-            collection=context_payload.get("collection"),
-            source_candidate=normalized,
-        )
-        final_candidate = synthesized
-        enforce_fn = getattr(DynamicResponseGenerator, "_enforce_identifier_consistency", None)
-        if callable(enforce_fn):
-            final_candidate = enforce_fn(synthesized, context_payload)
-        used_schema_fallback = True
+    final_candidate = normalized
+    used_schema_fallback = False
+    placeholder_check_fn = getattr(generator, "_has_generic_placeholder_content", None)
+    has_placeholder_content = (
+        bool(placeholder_check_fn(final_candidate))
+        if callable(placeholder_check_fn)
+        else False
+    )
 
     print("\n=== Parsed Candidate (normalized) ===")
     _safe_print(json_dumps(normalized))
     print(f"\nShape match: {shape_ok}")
     print(f"Schema fallback used: {used_schema_fallback}")
+    print(f"Has generic placeholder content: {has_placeholder_content}")
 
-    print("\n=== Final Candidate (after synthesizer + identifier consistency) ===")
+    print("\n=== Final Candidate (LLM output after normalization only) ===")
     _safe_print(json_dumps(final_candidate))
 
 

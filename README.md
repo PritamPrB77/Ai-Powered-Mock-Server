@@ -11,7 +11,7 @@ Production-ready FastAPI backend that:
 - maintains in-memory context across requests
 - exposes a minimal UI at `/` for spec upload and endpoint viewing
 
-## 1) Setup
+## 1 Setup
 
 ```bash
 pip install -r requirements.txt
@@ -34,20 +34,35 @@ Notes:
 - OpenRouter is used as fallback when Seq2Seq output is invalid/unavailable.
 - For fastest local mode, set `OPENROUTER_ENABLED=false` and `SEMANTIC_VALIDATION_ENABLED=false`.
 
-## 2) Run
+## 2 Run Backend
+
+Main command:
+
+```bash
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Equivalent short command:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-## 3) Use
+If you want port `8010`:
+
+```bash
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8010
+```
+
+## 3 User Guide
 
 1. Open `http://127.0.0.1:8000/`.
 2. Upload or paste OpenAPI YAML/JSON spec.
 3. Check generated endpoints from `/registered-endpoints`.
-4. Test dynamic endpoints in Postman.
+4. Send requests to generated endpoints from Postman/curl.
+5. If needed, add `?n=3` to return multiple generated responses.
 
-## 4) Multi-response
+## 4 Multi-response
 
 Use either:
 
@@ -55,3 +70,17 @@ Use either:
 - request body field: `"n": 3`
 
 The server caps `n` to `10`.
+
+## 5 About `uvicorn*.log` Files (Important or Not?)
+
+Files like:
+- `uvicorn.out.log`
+- `uvicorn.err.log`
+- `uvicorn_8010.out.log`
+- `uvicorn_8010.err.log`
+
+are runtime log files created when Uvicorn output is redirected to files.
+
+- Important for debugging startup/runtime errors.
+- Not required for the backend to run.
+- Safe to delete when the server is stopped (if you do not need old logs).

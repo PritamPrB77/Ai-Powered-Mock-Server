@@ -71,6 +71,17 @@ class SchemaSynthesizer:
         "status",
         "note",
     )
+    GENERIC_PLACEHOLDER_TEXTS = (
+        "john doe",
+        "jane doe",
+        "john smith",
+        "jane smith",
+        "lorem ipsum",
+        "foo bar",
+        "sample text",
+        "test user",
+        "customer name",
+    )
 
     def build(
         self,
@@ -305,15 +316,16 @@ class SchemaSynthesizer:
         fmt = str(schema.get("format", "")).lower()
 
         if isinstance(source_value, str) and source_value.strip():
-            if self._should_bind_path_context(
-                field_name=field_name,
-                schema=schema,
-                source_value=source_value,
-                request_body=request_body,
-                path_parameters=path_parameters,
-            ):
-                return self._ensure_path_context_in_text(source_value, path_parameters)
-            return source_value
+            if not self._is_generic_placeholder_text(source_value, field_name, schema):
+                if self._should_bind_path_context(
+                    field_name=field_name,
+                    schema=schema,
+                    source_value=source_value,
+                    request_body=request_body,
+                    path_parameters=path_parameters,
+                ):
+                    return self._ensure_path_context_in_text(source_value, path_parameters)
+                return source_value
 
         exact_id = self._infer_exact_identifier(field_name, request_body, path_parameters)
         generic_id = self._infer_any_identifier(request_body, path_parameters)
@@ -324,9 +336,10 @@ class SchemaSynthesizer:
             return datetime.now(timezone.utc).date().isoformat()
         if fmt == "email" or "email" in field:
             best_seed = self._best_text_seed(request_body)
+            suffix = f".{rng.randint(10, 99)}"
             local_name = self._safe_slug(
                 best_seed
-                or f"user{generic_id or rng.randint(100, 999)}"
+                or f"user{generic_id or rng.randint(100, 999)}{suffix}"
             )
             return f"{local_name}@{rng.choice(self.EMAIL_DOMAINS)}"
         if fmt == "uuid":
@@ -353,9 +366,6 @@ class SchemaSynthesizer:
                 return rng.choice(self.FIRST_NAMES)
             if "last" in field:
                 return rng.choice(self.LAST_NAMES)
-            resource_title = self._resource_title(collection)
-            if generic_id:
-                return f"{resource_title} {generic_id}"
             return f"{rng.choice(self.FIRST_NAMES)} {rng.choice(self.LAST_NAMES)}"
 
         if self._should_generate_contextual_text(
@@ -711,6 +721,30 @@ class SchemaSynthesizer:
         text = str(value or "user").strip().lower()
         text = re.sub(r"[^a-z0-9]+", ".", text).strip(".")
         return text or "user"
+
+    @staticmethod
+    def _is_generic_placeholder_text(
+        value: str,
+        field_name: str | None,
+        schema: dict[str, Any] | None = None,
+    ) -> bool:
+        text = value.strip().lower()
+        if not text:
+            return False
+        if text in SchemaSynthesizer.GENERIC_PLACEHOLDER_TEXTS:
+            return True
+        if "john doe" in text or "jane doe" in text:
+            return True
+        if "lorem ipsum" in text:
+            return True
+        if "customer@example.com" in text:
+            return True
+
+        field = (field_name or "").lower()
+        fmt = str((schema or {}).get("format", "")).lower()
+        if (fmt == "email" or "email" in field) and text.endswith("@example.com"):
+            return True
+        return False
 
     @staticmethod
     def _resource_title(collection: str | None) -> str:

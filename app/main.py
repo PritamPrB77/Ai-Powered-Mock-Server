@@ -95,8 +95,9 @@ class RuntimeState:
         parameters = validation.parameters
         path_parameters = dict(getattr(parameters, "path", {}) or {})
         query_parameters = dict(getattr(parameters, "query", {}) or {})
+        independent_mode = bool(self.settings.generation_independent_requests)
 
-        if operation.method == "get":
+        if operation.method == "get" and not independent_mode:
             cached = self.context_engine.get_cached_get_response(operation.path, path_parameters)
             if cached is not None:
                 payload = _shape_cached_payload(cached, n)
@@ -125,6 +126,10 @@ class RuntimeState:
         context_payload["operation_summary"] = operation.summary
         context_payload["operation_description"] = operation.description
         context_payload["request_nonce"] = time.time_ns()
+        if independent_mode:
+            context_payload["resolved_entity"] = None
+            context_payload["known_entities_for_collection"] = {}
+            context_payload["recent_history"] = []
 
         try:
             generated = await self.response_generator.generate(
@@ -139,21 +144,23 @@ class RuntimeState:
         except ResponseGenerationError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        for item in generated:
-            self.context_engine.update_from_response(
-                method=operation.method,
-                path_template=operation.path,
-                path_parameters=path_parameters,
-                response_payload=item,
-            )
+        if not independent_mode:
+            for item in generated:
+                self.context_engine.update_from_response(
+                    method=operation.method,
+                    path_template=operation.path,
+                    path_parameters=path_parameters,
+                    response_payload=item,
+                )
 
         payload: Any = generated[0] if n == 1 else generated
-        self.context_engine.append_history(
-            method=operation.method,
-            path_template=operation.path,
-            request_body=request_body,
-            response_payload=payload,
-        )
+        if not independent_mode:
+            self.context_engine.append_history(
+                method=operation.method,
+                path_template=operation.path,
+                request_body=request_body,
+                response_payload=payload,
+            )
         return JSONResponse(status_code=operation.response_status_code, content=payload)
 
 

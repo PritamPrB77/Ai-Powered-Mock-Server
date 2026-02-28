@@ -98,39 +98,35 @@ class DynamicResponseGenerator:
             )
             for source in self._generation_source_order():
                 try:
-                    raw_candidate = await self._generate_candidate(
+                    candidate = await self._generate_candidate(
                         source=source,
                         prompt=prompt,
                         temperature=temperature,
                     )
-                    if raw_candidate is None:
+                    if candidate is None:
                         last_error = f"{source} source unavailable."
                         continue
 
-                    candidate = self._normalize_candidate_shape(operation.response_schema, raw_candidate)
-                    if self._is_structurally_valid(
+                    if not self._matches_response_shape(operation.response_schema, candidate):
+                        last_error = f"{source} candidate JSON shape does not match response schema type."
+                        continue
+
+                    candidate = self.schema_synthesizer.build(
+                        schema=operation.response_schema,
+                        request_body=validated_request_body,
+                        path_parameters=context_payload.get("path_parameters"),
+                        collection=str(context_payload.get("collection", "")),
+                        source_candidate=candidate,
+                    )
+
+                    if not self._is_structurally_valid(
                         operation=operation,
                         openapi=openapi,
                         openapi_request=openapi_request,
                         candidate=candidate,
                     ):
-                        pass
-                    else:
-                        candidate = self.schema_synthesizer.build(
-                            schema=operation.response_schema,
-                            request_body=validated_request_body,
-                            path_parameters=context_payload.get("path_parameters"),
-                            collection=str(context_payload.get("collection", "")),
-                            source_candidate=candidate,
-                        )
-                        if not self._is_structurally_valid(
-                            operation=operation,
-                            openapi=openapi,
-                            openapi_request=openapi_request,
-                            candidate=candidate,
-                        ):
-                            last_error = f"{source} candidate failed OpenAPI response validation."
-                            continue
+                        last_error = f"{source} candidate failed OpenAPI response validation."
+                        continue
 
                     semantic_score = 1.0
                     if self.settings.semantic_validation_enabled:
@@ -184,11 +180,15 @@ class DynamicResponseGenerator:
             validated_request_body=validated_request_body,
             context_payload=context_payload,
         )
-        if schema_candidate is not None and self._is_structurally_valid(
+        if (
+            self._provider_name() != "openrouter"
+            and schema_candidate is not None
+            and self._is_structurally_valid(
             operation=operation,
             openapi=openapi,
             openapi_request=openapi_request,
             candidate=schema_candidate,
+            )
         ):
             logger.warning(
                 "Returning schema-derived fallback candidate after generation retries failed."
@@ -235,7 +235,19 @@ class DynamicResponseGenerator:
         raise ResponseGenerationError(f"Unknown generation source: {source}")
 
     def _generation_source_order(self) -> list[str]:
-        provider = self._provider_name()
+        sources: list[str] = []
+        has_seq2seq = self.seq2seq_generator is not None and self.seq2seq_generator.enabled
+        if has_seq2seq:
+            sources.append("seq2seq")
+
+        provider = str(self.settings.generation_provider).strip().lower()
+        if provider not in {"ollama", "openrouter"}:
+            logger.warning(
+                "Unknown GENERATION_PROVIDER '%s'. Falling back to 'ollama'.",
+                self.settings.generation_provider,
+            )
+            provider = "ollama"
+
         ollama_allowed = (
             self.settings.ollama_enabled
             and bool(self.settings.ollama_url)
@@ -244,18 +256,12 @@ class DynamicResponseGenerator:
         openrouter_allowed = self.settings.openrouter_enabled and bool(self.settings.openrouter_api_key)
 
         if provider == "ollama":
-            return ["ollama"] if ollama_allowed else []
-        if provider == "openrouter":
-            return ["openrouter"] if openrouter_allowed else []
-
-        has_seq2seq = self.seq2seq_generator is not None and self.seq2seq_generator.enabled
-        return ["seq2seq"] if has_seq2seq else []
-
-    def _provider_name(self) -> str:
-        provider = str(self.settings.generation_provider).strip().lower()
-        if provider in {"ollama", "openrouter"}:
-            return provider
-        return "ollama"
+            if ollama_allowed and (not has_seq2seq or self.settings.ollama_fallback_enabled):
+                sources.append("ollama")
+        elif provider == "openrouter":
+            if openrouter_allowed and (not has_seq2seq or self.settings.openrouter_fallback_enabled):
+                sources.append("openrouter")
+        return sources
 
     def _has_active_generation_source(self) -> bool:
         return bool(self._generation_source_order())
@@ -273,60 +279,6 @@ class DynamicResponseGenerator:
             collection=str(context_payload.get("collection", "")),
             source_candidate=None,
         )
-
-    async def _call_ollama(self, prompt: str, temperature: float | None = None) -> Any:
-        selected_temperature = (
-            self.settings.generation_temperature
-            if temperature is None
-            else float(temperature)
-        )
-        full_prompt = self._build_ollama_prompt(prompt)
-        payload = {
-            "model": self.settings.ollama_model,
-            "prompt": full_prompt,
-            "format": "json",
-            "stream": False,
-            "options": {
-                "temperature": selected_temperature,
-                "num_predict": self.settings.ollama_num_predict,
-                "top_k": self.settings.ollama_top_k,
-                "top_p": self.settings.ollama_top_p,
-                "seed": int(time.time_ns() % 2147483647),
-            },
-        }
-
-        timeout = httpx.Timeout(self.settings.generation_timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                response = await client.post(
-                    self.settings.ollama_url,
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail = exc.response.text.strip() if exc.response is not None else str(exc)
-                raise ResponseGenerationError(f"Ollama request failed: {detail}") from exc
-            except httpx.RequestError as exc:
-                raise ResponseGenerationError(f"Ollama connection failed: {exc}") from exc
-            data = response.json()
-
-        try:
-            llm_text = data["response"]
-        except (KeyError, TypeError) as exc:
-            raise ResponseGenerationError(f"Unexpected Ollama response payload: {data}") from exc
-
-        if not isinstance(llm_text, str):
-            raise ResponseGenerationError(f"Unexpected Ollama response payload: {data}")
-
-        logger.info(
-            "Ollama response received. model=%s chars=%s",
-            self.settings.ollama_model,
-            len(llm_text),
-        )
-        logger.debug("Ollama raw output: %s", llm_text)
-
-        return extract_json_value(llm_text)
 
     async def _call_openrouter(self, prompt: str, temperature: float | None = None) -> Any:
         selected_temperature = (
@@ -358,12 +310,17 @@ class DynamicResponseGenerator:
 
         timeout = httpx.Timeout(self.settings.generation_timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                self.settings.openrouter_url,
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
+            try:
+                response = await client.post(
+                    self.settings.openrouter_url,
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                response_text = exc.response.text.strip() if exc.response is not None else ""
+                detail = response_text or str(exc)
+                raise ResponseGenerationError(f"OpenRouter request failed: {detail}") from exc
             data = response.json()
 
         try:
@@ -373,17 +330,67 @@ class DynamicResponseGenerator:
 
         return extract_json_value(llm_text)
 
-    def _build_ollama_prompt(self, task_prompt: str) -> str:
-        system_prompt = self.settings.ollama_system_prompt.strip()
-        if not system_prompt:
-            system_prompt = "Return strictly valid JSON only."
-        return (
-            f"{system_prompt}\n\n"
-            "Task:\n"
-            f"{task_prompt}\n\n"
-            "Output:\n"
-            "JSON only."
+    def _provider_name(self) -> str:
+        provider = str(self.settings.generation_provider).strip().lower()
+        if provider in {"ollama", "openrouter"}:
+            return provider
+        return "ollama"
+
+    @staticmethod
+    def _matches_response_shape(schema: dict[str, Any] | None, candidate: Any) -> bool:
+        if not isinstance(schema, dict):
+            return True
+        expected_type = schema.get("type")
+        if expected_type == "object":
+            return isinstance(candidate, dict)
+        if expected_type == "array":
+            return isinstance(candidate, list)
+        return True
+
+    async def _call_ollama(self, prompt: str, temperature: float | None = None) -> Any:
+        selected_temperature = (
+            self.settings.generation_temperature
+            if temperature is None
+            else float(temperature)
         )
+        payload = {
+            "model": self.settings.ollama_model,
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+            "options": {
+                "temperature": selected_temperature,
+                "num_predict": self.settings.ollama_num_predict,
+                "top_k": self.settings.ollama_top_k,
+                "top_p": self.settings.ollama_top_p,
+                "seed": int(time.time_ns() % 2147483647),
+            },
+        }
+
+        timeout = httpx.Timeout(self.settings.generation_timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                response = await client.post(
+                    self.settings.ollama_url,
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                response_text = exc.response.text.strip() if exc.response is not None else ""
+                detail = response_text or str(exc)
+                raise ResponseGenerationError(f"Ollama request failed: {detail}") from exc
+            data = response.json()
+
+        try:
+            llm_text = data["response"]
+        except (KeyError, TypeError) as exc:
+            raise ResponseGenerationError(f"Unexpected Ollama response payload: {data}") from exc
+
+        if not isinstance(llm_text, str):
+            raise ResponseGenerationError(f"Unexpected Ollama response payload: {data}")
+
+        return extract_json_value(llm_text)
 
     @staticmethod
     def _build_prompt(
@@ -391,57 +398,25 @@ class DynamicResponseGenerator:
         validated_request_body: Any,
         context_payload: dict[str, Any],
     ) -> str:
-        api_info = context_payload.get("api_info")
-        operation_summary = context_payload.get("operation_summary")
-        operation_description = context_payload.get("operation_description")
-        path_parameters = context_payload.get("path_parameters")
-        query_parameters = context_payload.get("query_parameters")
         return (
-            "You are an autonomous API response generation engine.\n\n"
-            "Generate one dynamic response for the current request.\n\n"
-            "Rules:\n"
-            "1. Follow RESPONSE_SCHEMA exactly (type, required fields, allowed fields).\n"
-            "2. Use endpoint path, method, path/query params, and request body when logically relevant.\n"
-            "3. Preserve identifiers from request inputs when semantically appropriate.\n"
-            "4. Keep non-identifier fields realistic and naturally varied.\n"
-            "5. Do not add markdown, explanations, or extra fields.\n"
-            "6. Output strictly valid JSON only.\n\n"
-            f"API Info:\n{json_dumps(api_info)}\n\n"
-            f"Endpoint path: {operation.path}\n"
-            f"HTTP method: {operation.method.upper()}\n\n"
-            f"Operation summary:\n{json_dumps(operation_summary)}\n\n"
-            f"Operation description:\n{json_dumps(operation_description)}\n\n"
-            f"Request schema:\n{json_dumps(operation.request_schema)}\n\n"
-            f"Response schema:\n{json_dumps(operation.response_schema)}\n\n"
-            f"Validated request body:\n{json_dumps(validated_request_body)}\n\n"
-            f"Path parameters:\n{json_dumps(path_parameters)}\n\n"
-            f"Query parameters:\n{json_dumps(query_parameters)}\n\n"
-            "Return only JSON."
+            "You are generating a dynamic mock API response.\n\n"
+            f"Endpoint: {operation.path}\n"
+            f"Method: {operation.method.upper()}\n\n"
+            "Sequence-to-sequence context:\n"
+            "1) Read request schema and validated request data.\n"
+            "2) Map request intent into response schema fields.\n"
+            "3) Produce final JSON output.\n\n"
+            f"Request Schema:\n{json_dumps(operation.request_schema)}\n\n"
+            f"Response Schema:\n{json_dumps(operation.response_schema)}\n\n"
+            f"Validated Request Body:\n{json_dumps(validated_request_body)}\n\n"
+            f"System Context:\n{json_dumps(context_payload)}\n\n"
+            "Output constraints:\n"
+            "- Return JSON only.\n"
+            "- Match response schema exactly.\n"
+            "- Use field names exactly as in Response Schema.\n"
+            "- Preserve identifier values from path parameters even when naming style differs "
+            "(example: chapterNumber -> chapter_number).\n"
+            "- For different path parameter values, vary content fields accordingly.\n"
+            "- Do not add extra fields.\n"
+            "- Ensure logical consistency with request and context."
         )
-
-    @staticmethod
-    def _normalize_candidate_shape(schema: dict[str, Any] | None, candidate: Any) -> Any:
-        if not isinstance(schema, dict):
-            return candidate
-
-        expected_type = schema.get("type")
-        if expected_type == "array":
-            if isinstance(candidate, list):
-                return candidate
-            if isinstance(candidate, dict):
-                list_values = [value for value in candidate.values() if isinstance(value, list)]
-                if len(list_values) == 1:
-                    return list_values[0]
-                if len(list_values) > 1:
-                    return max(list_values, key=len)
-                return [candidate]
-            return candidate
-
-        if expected_type == "object":
-            if isinstance(candidate, dict):
-                return candidate
-            if isinstance(candidate, list) and len(candidate) == 1 and isinstance(candidate[0], dict):
-                return candidate[0]
-            return candidate
-
-        return candidate
